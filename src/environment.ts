@@ -8,6 +8,7 @@ const environmentType = z.object({
 
   DATABASE_URL: z.string().default(''),
   PORT: z.string().default('666').transform(Number),
+  SQLITE_PATH: z.string().default(''),
 
   PROCESSOR_BASIC_URL: z.url().default('http://quasar.int.bksp.in:17003/process'),
 

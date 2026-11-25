@@ -10,7 +10,7 @@ export interface DeviceInfo {
 
 @Entity('device')
 class Device {
-  @Column('jsonb')
+  @Column('simple-json')
   config!: unknown
 
   @PrimaryColumn('text')
@@ -23,12 +23,19 @@ class Device {
 export class DeviceStorage {
   private readonly dataSource: DataSource
 
-  constructor (databaseUrl: string) {
+  constructor (databaseUrl: string, sqlitePath = '') {
     this.dataSource = new DataSource({
       entities: [Device],
       synchronize: true,
-      type: 'postgres',
-      url: databaseUrl
+      ...(sqlitePath
+        ? {
+            database: sqlitePath,
+            type: 'better-sqlite3' as const
+          }
+        : {
+            type: 'postgres' as const,
+            url: databaseUrl
+          })
     })
   }
 

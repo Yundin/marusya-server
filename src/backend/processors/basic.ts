@@ -1,10 +1,9 @@
 import { getTraceData, Span, startInactiveSpan } from '@sentry/node'
-import {
-  PROCESSOR_METADATA_SERVER_TYPE_KEY, ProcessorClientWebSocketMessage,
-  ProcessorMetadataServerType, processorServerWebSocketMessage
-} from '@v3rt3p/types/processor'
+import { ProcessorClientWebSocketMessage, processorServerWebSocketMessage } from '@v3rt3p/types/processor'
 import { EventEmitter } from 'node:stream'
 import { Event, WebSocket } from 'ws'
+
+import type { DirectiveFunctions } from '../../directive-functions'
 
 import { ProcessorBackend, ProcessorRequest, ProcessorSession, ProcessorSessionEvents } from '../backend'
 
@@ -78,9 +77,12 @@ export class BasicProcessorSession extends EventEmitter<ProcessorSessionEvents> 
     this.webSocket.close()
   }
 
-  prepare (): Promise<void> {
+  prepare (directiveFunctions: DirectiveFunctions = {}): Promise<void> {
+    // types 1.0.15 знает directiveFunctions в prepare — каст больше не нужен.
     return this.send({
-      data: {},
+      data: {
+        directiveFunctions
+      },
       type: 'prepare'
     })
   }
@@ -88,11 +90,8 @@ export class BasicProcessorSession extends EventEmitter<ProcessorSessionEvents> 
   process (request: ProcessorRequest): Promise<void> {
     return this.send({
       data: {
-        ...request,
-        metadata: {
-          ...request.metadata,
-          [PROCESSOR_METADATA_SERVER_TYPE_KEY]: ProcessorMetadataServerType.MARUSYA
-        }
+        metadata: request.metadata,
+        text: request.text
       },
       type: 'process'
     })

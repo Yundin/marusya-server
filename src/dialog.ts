@@ -1,7 +1,8 @@
-import { Directive } from '@v3rt3p/types/directives'
 import { Sema } from 'async-sema'
 
 import { AudioMetadataBackend, AudioMetadataBackendSession, ProcessorBackend, ProcessorSession, STTBackend, STTBackendSession, TTSBackend } from './backend/backend'
+import { MARUSYA_DIRECTIVE_FUNCTIONS } from './directive-functions'
+import { Directive, directiveCallToDirective } from './directives'
 import { getLogger } from './logger'
 import { Notifier } from './notifier'
 
@@ -82,7 +83,7 @@ export class Dialog {
   }
 
   async handleEventText (eventText: string): Promise<void> {
-    await this.processText(eventText, true)
+    await this.processText(eventText)
   }
 
   async handleStartVoice (): Promise<void> {
@@ -102,8 +103,11 @@ export class Dialog {
     this.sttSession = sttSession
 
     this.sttSession.setCallback(result => {
+      if (result.text) {
+        this.lastText = result.text
+      }
       if (result.endOfUtt) {
-        this.processText(result.text, false).catch(error => {
+        this.processText(result.text).catch(error => {
           this.logger.warn('failed to process text: ', error)
         })
       }
@@ -142,7 +146,7 @@ export class Dialog {
 
   init (): void {
     this.openSessionPromise = this.properties.processor.openSession().then(async session => {
-      await session.prepare()
+      await session.prepare(MARUSYA_DIRECTIVE_FUNCTIONS)
       return session
     })
   }
@@ -169,11 +173,11 @@ export class Dialog {
     }
   }
 
-  private async processText (text: string, isExternalEvent: boolean): Promise<void> {
+  private async processText (text: string): Promise<void> {
     this.state = DialogState.PROCESSING_TEXT
     this.sttSession?.close()
     this.sttSession = undefined
-    const metadata = await this.audioMetadataSession?.finish() ?? {}
+    const audioMetadata = await this.audioMetadataSession?.finish() ?? {}
     this.audioMetadataSession = undefined
     this.lastProcessedChunk = -1
 
@@ -200,6 +204,11 @@ export class Dialog {
       })
 
       processorSession.addListener('partialResponse', partialResponse => {
+        // processor (types 1.0.15) присылает directives как вызовы функций
+        // {name, arguments} — конвертируем в device-директивы для vc-api.
+        const directives = partialResponse.directives
+          .map(call => directiveCallToDirective(call))
+          .filter((directive): directive is Directive => directive !== null)
         if (partialResponse.finished) {
           if (partialResponse.shouldListen) {
             this.state = DialogState.READY_TO_START_VOICE
@@ -210,7 +219,7 @@ export class Dialog {
         }
         if (!partialResponse.text) {
           this.responsesQueue.push({
-            directives: partialResponse.directives,
+            directives,
             finished: partialResponse.finished,
             shouldListen: partialResponse.finished ? partialResponse.shouldListen : false,
             speech: Buffer.from([]),
@@ -222,7 +231,7 @@ export class Dialog {
           text: partialResponse.text
         }).then(result => {
           this.responsesQueue.push({
-            directives: partialResponse.directives,
+            directives,
             finished: partialResponse.finished,
             shouldListen: partialResponse.finished ? partialResponse.shouldListen : false,
             speech: Buffer.from(result.voiceOutput),
@@ -231,7 +240,7 @@ export class Dialog {
         }).catch(error => {
           this.logger.error('failed to synthesize: ', error)
           this.responsesQueue.push({
-            directives: partialResponse.directives,
+            directives,
             finished: partialResponse.finished,
             shouldListen: partialResponse.finished ? partialResponse.shouldListen : false,
             speech: Buffer.from([]),
@@ -243,9 +252,14 @@ export class Dialog {
 
     this.processorSesssion = processorSession
 
+    // types 1.0.15: metadata процессора строго {internal, readyToUse};
+    // аудио-метаданные уходят в internal (для state/function-серверов),
+    // readyToUse (состояние для LLM) у нас нет.
     await processorSession.process({
-      isExternalEvent,
-      metadata,
+      metadata: {
+        internal: audioMetadata,
+        readyToUse: {}
+      },
       text
     })
   }

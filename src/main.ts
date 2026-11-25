@@ -20,7 +20,7 @@ import { registerVCApiRoutes, VCConnection } from './vc-api'
 const logger = getLogger()
 const environment = getEnvironment()
 
-const storage = new DeviceStorage(environment.DATABASE_URL)
+const storage = new DeviceStorage(environment.DATABASE_URL, environment.SQLITE_PATH)
 
 const backends = {
   audioMetadata: new BufferedAudioMetadataBackend(environment.AUDIO_METADATA_URLS),

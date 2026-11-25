@@ -6,11 +6,13 @@ import z from 'zod'
 
 import { AudioMetadataBackend, ProcessorBackend, STTBackend, TTSBackend } from './backend/backend'
 import { convertContentPrivacyConfig, convertGeneralConfig, convertNightModeConfig, convertSafeModeConfig, convertSpotifyConfig, convertStereoConfig, convertTelegramConfig, convertVkCallsConfig } from './config'
-import { Dialog } from './dialog'
+import { Dialog, DialogResult } from './dialog'
+import { Directive } from './directives'
 import { getLogger } from './logger'
 import { getBoundary, parse } from './multipart'
-import { DeviceStorage } from './storage/database'
+import { DeviceInfo, DeviceStorage } from './storage/database'
 import { getDefaultDeviceConfig } from './storage/defaults'
+import { RequestDeviceInfo } from './types'
 
 enum VCConnectionMessageType {
   ACK = 1,
@@ -18,6 +20,8 @@ enum VCConnectionMessageType {
   UPDATE_CONFIG = 8,
   COMMAND_CONTROL = 10
 }
+
+const FIRMWARE_VERSION = '44.90'
 
 interface VCApiBackends {
   audioMetadata: AudioMetadataBackend,
@@ -418,6 +422,31 @@ export function registerVCApiRoutes (app: Application, server: Server,
     })
   })
 
+  // OTA: колонка проверяет обновления, всегда отвечаем «обновлений нет»
+  app.get('/device/firmware', (_request, response) => {
+    response.status(200).json({
+      qid: generateQueryId(),
+      result: {
+        capabilities: '0',
+        description: null,
+        filename: FIRMWARE_VERSION,
+        label: 'local',
+        need_auth: false,
+        need_update: false,
+        platform: 'Capsula-mini-6',
+        source: 'local',
+        ts: Math.floor(Date.now() / 1000),
+        url: '',
+        version: FIRMWARE_VERSION
+      }
+    })
+  })
+
+  // gRPC-проба возможностей: пустой unary ответ
+  app.post('/vk.voice.grpc.front.v1.service.ClientProbe/AuthReady', (_request, response) => {
+    response.status(200).header({ 'content-type': 'application/grpc' }).end()
+  })
+
   app.post('/phrase/create/event', (request, response) => {
     if (!request.deviceInfo) {
       response.status(500).end()
@@ -609,7 +638,7 @@ export function registerVCApiRoutes (app: Application, server: Server,
     })
   })
 
-  app.get('/phrase/result', (request, response) => {
+  app.get('/phrase/result', async (request, response) => {
     if (!request.deviceInfo) {
       response.status(500).end()
       return
@@ -628,14 +657,88 @@ export function registerVCApiRoutes (app: Application, server: Server,
       return
     }
 
+    // Капсула Мини (44.90) получает весь ответ ассистента здесь,
+    // /phrase/commands не использует. Ждём финальный результат диалога
+    // (частичные ответы склеиваются в один список команд).
+    const deadline = Date.now() + 25_000
+    const parts: DialogResult[] = []
+    while (Date.now() < deadline) {
+      const part = dialog.getNextResult()
+      if (part) {
+        parts.push(part)
+        if (part.finished) {
+          break
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+
+    const asrText = dialog.getLastAsrResult()
+    const last = parts.at(-1)
+    const finished = last !== undefined && last.finished === true
+    const shouldListen = finished && last !== undefined && last.shouldListen === true
+
+    if (finished && !shouldListen) {
+      dialog.close()
+      dialogIdToDialogMap.delete(dialogId)
+      deviceIdToActiveDialogIdMap.delete(request.deviceInfo.deviceId)
+    }
+
+    let commands: unknown[] = []
+    try {
+      const device = await storage.getOrCreate(request.deviceInfo.deviceId,
+        getDefaultDeviceConfig())
+
+      commands = (await Promise.all(parts.map(async (part, index) => {
+        const isLast = index === parts.length - 1
+        const built = await buildDeviceDirectives(part.directives, request.deviceInfo!, device)
+
+        const chunkCommands: unknown[] = [...built]
+
+        if (part.text !== null) {
+          const streamId = randomUUID()
+          streamIdToSpeechMap.set(streamId, part.speech)
+          chunkCommands.push({
+            blocking: true,
+            encoder: 'opus',
+            encoder_bitrate: null,
+            encoder_frame_size: null,
+            force_say: false,
+            kws_skip: null,
+            long_reader_request: false,
+            model_name: 'tts',
+            normalize: true,
+            speed: 1,
+            stream_hls: false,
+            stream_id: streamId,
+            text: part.text,
+            type: 'tts'
+          })
+        }
+
+        if (isLast && part.finished && part.shouldListen) {
+          chunkCommands.push({
+            blocking: true,
+            callback_data: JSON.stringify({ dialogId }),
+            min_waiting_time: 4,
+            mute_activation_sound: false,
+            type: 'listen'
+          })
+        }
+
+        return chunkCommands
+      }))).flat()
+    } catch (error) {
+      logger.error('failed to build phrase result: ', error)
+    }
+
     response.status(200).json({
       qid: generateQueryId(),
       result: {
-        asr_text: '',
-        commands: [],
+        asr_text: asrText,
+        commands,
         controls: [],
         intent: 'radioegor146',
-        page_token: `${phraseId}/${randomUUID()}`,
         secure: false,
         skill: 'radioegor146'
       }
@@ -663,6 +766,93 @@ export function registerVCApiRoutes (app: Application, server: Server,
   })
 
   const streamIdToSpeechMap: Map<string, Buffer> = new Map()
+
+  /**
+   * Преобразует директивы processor'а в команды колонки (volume, bluetooth, custom).
+   * Общая для /phrase/commands и /phrase/result.
+   */
+  async function buildDeviceDirectives (directiveList: Directive[], deviceInfo: RequestDeviceInfo,
+    device: DeviceInfo): Promise<unknown[]> {
+    const directives: unknown[] = []
+
+    let needConfigUpdate = false
+
+    for (const directive of directiveList) {
+      switch (directive.type) {
+        case 'bluetoothDisable': {
+          directives.push({
+            turn_on: false,
+            type: 'bluetooth_pair'
+          })
+          break
+        }
+        case 'bluetoothEnable': {
+          directives.push({
+            turn_on: true,
+            type: 'bluetooth_pair'
+          })
+          break
+        }
+        case 'customMarusya': {
+          directives.push(directive.data)
+          break
+        }
+        case 'customQuasar': {
+          continue
+        }
+        case 'soundLouder': {
+          needConfigUpdate = true
+          device.config.settings.general.masterVolume =
+            Math.min(100, device.config.settings.general.masterVolume + 10)
+          device.config.settings.general.revision++
+          storage.saveConfig(device)
+            .then(() => logger.debug('config saved'))
+            .catch(error => logger.error('failed to save config: ', error))
+          directives.push({
+            level: device.config.settings.general.masterVolume,
+            type: 'volume_control'
+          })
+          break
+        }
+        case 'soundQuieter': {
+          needConfigUpdate = true
+          device.config.settings.general.masterVolume =
+            Math.max(10, device.config.settings.general.masterVolume - 10)
+          device.config.settings.general.revision++
+          storage.saveConfig(device)
+            .then(() => logger.debug('config saved'))
+            .catch(error => logger.error('failed to save config: ', error))
+          directives.push({
+            level: device.config.settings.general.masterVolume,
+            type: 'volume_control'
+          })
+          break
+        }
+        case 'soundSetLevel': {
+          needConfigUpdate = true
+          device.config.settings.general.masterVolume = directive.level * 10
+          device.config.settings.general.revision++
+          storage.saveConfig(device)
+            .then(() => logger.debug('config saved'))
+            .catch(error => logger.error('failed to save config: ', error))
+          directives.push({
+            level: device.config.settings.general.masterVolume,
+            type: 'volume_control'
+          })
+          continue
+        }
+      }
+    }
+
+    if (needConfigUpdate) {
+      directives.push({
+        settings: convertGeneralConfig(deviceInfo.deviceId, device.name, device.config.settings.general),
+        type: 'general_settings_v1'
+      })
+    }
+
+    return directives
+  }
 
   app.post('/phrase/commands', (request, response) => {
     if (!request.deviceInfo) {
@@ -720,84 +910,8 @@ export function registerVCApiRoutes (app: Application, server: Server,
 
     storage.getOrCreate(request.deviceInfo.deviceId,
       getDefaultDeviceConfig())
-      .then(device => {
-        const directives: unknown[] = []
-
-        let needConfigUpdate = false
-
-        for (const directive of result.directives) {
-          switch (directive.type) {
-            case 'bluetoothDisable': {
-              directives.push({
-                turn_on: false,
-                type: 'bluetooth_pair'
-              })
-              break
-            }
-            case 'bluetoothEnable': {
-              directives.push({
-                turn_on: true,
-                type: 'bluetooth_pair'
-              })
-              break
-            }
-            case 'customMarusya': {
-              directives.push(directive.data)
-              break
-            }
-            case 'customQuasar': {
-              continue
-            }
-            case 'soundLouder': {
-              needConfigUpdate = true
-              device.config.settings.general.masterVolume =
-                Math.min(100, device.config.settings.general.masterVolume + 10)
-              device.config.settings.general.revision++
-              storage.saveConfig(device)
-                .then(() => logger.debug('config saved'))
-                .catch(error => logger.error('failed to save config: ', error))
-              directives.push({
-                level: device.config.settings.general.masterVolume,
-                type: 'volume_control'
-              })
-              break
-            }
-            case 'soundQuieter': {
-              needConfigUpdate = true
-              device.config.settings.general.masterVolume =
-                Math.max(10, device.config.settings.general.masterVolume - 10)
-              device.config.settings.general.revision++
-              storage.saveConfig(device)
-                .then(() => logger.debug('config saved'))
-                .catch(error => logger.error('failed to save config: ', error))
-              directives.push({
-                level: device.config.settings.general.masterVolume,
-                type: 'volume_control'
-              })
-              break
-            }
-            case 'soundSetLevel': {
-              needConfigUpdate = true
-              device.config.settings.general.masterVolume = directive.level * 10
-              device.config.settings.general.revision++
-              storage.saveConfig(device)
-                .then(() => logger.debug('config saved'))
-                .catch(error => logger.error('failed to save config: ', error))
-              directives.push({
-                level: device.config.settings.general.masterVolume,
-                type: 'volume_control'
-              })
-              continue
-            }
-          }
-        }
-
-        if (needConfigUpdate) {
-          directives.push({
-            settings: convertGeneralConfig(request.deviceInfo.deviceId, device.name, device.config.settings.general),
-            type: 'general_settings_v1'
-          })
-        }
+      .then(async device => {
+        const directives = await buildDeviceDirectives(result.directives, request.deviceInfo!, device)
 
         response.status(200).json({
           qid: generateQueryId(),

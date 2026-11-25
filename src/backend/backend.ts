@@ -18,7 +18,7 @@ export type ProcessorRequest = ProcessorProcessWebSocketMessage['data']
 
 export interface ProcessorSession extends EventEmitter<ProcessorSessionEvents> {
   close(): void;
-  prepare(): Promise<void>;
+  prepare(directiveFunctions?: import('../directive-functions').DirectiveFunctions): Promise<void>;
   process(request: ProcessorRequest): Promise<void>;
 }
 
