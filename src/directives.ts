@@ -66,7 +66,12 @@ export function directiveCallToDirective (call: DirectiveFunctionCall): Directiv
       if (typeof arguments_?.level !== 'number' || !Number.isFinite(arguments_.level)) {
         return null
       }
-      return { level: Math.round(arguments_.level), type: 'soundSetLevel' }
+      // LLM может прислать level вне схемы (0..10); без клампа level*10 уйдёт
+      // в masterVolume и сохранится в конфиг устройства как есть.
+      return {
+        level: Math.min(10, Math.max(0, Math.round(arguments_.level))),
+        type: 'soundSetLevel'
+      }
     }
     default: {
       return null
