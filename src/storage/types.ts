@@ -2,6 +2,12 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import z from 'zod'
 
 const rawDeviceConfig = z.object({
+  auth: z.object({
+    accountId: z.string().default(''),
+    attachedAt: z.number().default(0),
+    sessionSecret: z.string().default(''),
+    xtokenId: z.string().default('')
+  }),
   global: z.object({
     vkDomain: z.string().default('notvk.notcom')
   }),
