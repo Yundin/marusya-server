@@ -8,6 +8,7 @@ import { AudioMetadataBackend, ProcessorBackend, STTBackend, TTSBackend } from '
 import { convertContentPrivacyConfig, convertGeneralConfig, convertNightModeConfig, convertSafeModeConfig, convertSpotifyConfig, convertStereoConfig, convertTelegramConfig, convertVkCallsConfig } from './config'
 import { Dialog, DialogResult } from './dialog'
 import { Directive } from './directives'
+import { getEnvironment } from './environment'
 import { getLogger } from './logger'
 import { getBoundary, parse } from './multipart'
 import { DeviceInfo, DeviceStorage } from './storage/database'
@@ -117,6 +118,105 @@ export class VCConnection {
 export function registerVCApiRoutes (app: Application, server: Server,
   storage: DeviceStorage, backends: VCApiBackends): VCRouter {
   const logger = getLogger()
+  const environment = getEnvironment()
+
+  // AUTH_MODE=enforce: все vc-запросы (кроме attach_xtoken — это вход) требуют
+  // Bearer <session_secret>, выданный при /account/attach_xtoken. Fail-closed:
+  // пустой/неверный секрет → 401. Формат ошибки — по образцу облака (дамп 22.11).
+  if (environment.AUTH_MODE === 'enforce') {
+    app.use((request, response, next) => {
+      if (request.path === '/account/attach_xtoken' || !request.deviceInfo) {
+        next()
+        return
+      }
+
+      storage.getOrCreate(request.deviceInfo.deviceId, getDefaultDeviceConfig())
+        .then(device => {
+          const expectedSecret = device.config.auth.sessionSecret
+          if (expectedSecret && request.headers.authorization === `Bearer ${expectedSecret}`) {
+            next()
+            return
+          }
+
+          response.status(401).json({
+            code: 401,
+            error: '401:Unauthorized',
+            qid: generateQueryId(),
+            reason: 'Invalid or missing session secret'
+          })
+        })
+        .catch(error => {
+          logger.error('failed to check auth: ', error)
+          response.status(500).end()
+        })
+    })
+  }
+
+  app.post('/account/attach_xtoken', (request, response) => {
+    if (!request.deviceInfo) {
+      response.status(500).end()
+      return
+    }
+
+    const xtokenId = request.query['xtoken_id']
+      ? String(Array.isArray(request.query['xtoken_id'])
+        ? request.query['xtoken_id'][0]
+        : request.query['xtoken_id'])
+      : ''
+
+    storage.getOrCreate(request.deviceInfo.deviceId,
+      getDefaultDeviceConfig())
+      .then(device => {
+        if (!device.config.auth.accountId) {
+          device.config.auth.accountId = randomUUID()
+        }
+        device.config.auth.sessionSecret = randomBytes(32).toString('base64url')
+        device.config.auth.xtokenId = xtokenId
+        device.config.auth.attachedAt = Date.now()
+
+        return storage.saveConfig(device).then(() => {
+          response.status(200).json({
+            qid: generateQueryId(),
+            result: {
+              account_id: device.config.auth.accountId,
+              coordinates: '',
+              session_id: randomUUID(),
+              session_secret: device.config.auth.sessionSecret
+            }
+          })
+        })
+      })
+      .catch(error => {
+        logger.error('failed to attach xtoken: ', error)
+        response.status(500).end()
+      })
+  })
+
+  app.get('/account/info', (request, response) => {
+    if (!request.deviceInfo) {
+      response.status(500).end()
+      return
+    }
+
+    storage.getOrCreate(request.deviceInfo.deviceId,
+      getDefaultDeviceConfig())
+      .then(device => {
+        response.status(200).json({
+          qid: generateQueryId(),
+          result: {
+            account_id: device.config.auth.accountId,
+            phone: null,
+            profiles: [],
+            sessions_count: 1,
+            username: environment.ACCOUNT_USERNAME
+          }
+        })
+      })
+      .catch(error => {
+        logger.error('failed to get account info: ', error)
+        response.status(500).end()
+      })
+  })
 
   app.get('/account/settings/v1/reminders', (request, response) => {
     if (!request.deviceInfo) {
@@ -969,9 +1069,36 @@ export function registerVCApiRoutes (app: Application, server: Server,
 
   server.on('upgrade', (request, socket, head) => {
     if (request.url?.startsWith('/connect')) {
-      wsServer.handleUpgrade(request, socket, head, client => {
-        wsServer.emit('connection', client, request)
-      })
+      const handleConnection = () => {
+        wsServer.handleUpgrade(request, socket, head, client => {
+          wsServer.emit('connection', client, request)
+        })
+      }
+
+      if (environment.AUTH_MODE !== 'enforce') {
+        handleConnection()
+        return
+      }
+
+      const deviceId = new URLSearchParams(request.url.split('?')[1] ?? '').get('device_id')
+      if (!deviceId) {
+        socket.destroy()
+        return
+      }
+
+      storage.getOrCreate(deviceId, getDefaultDeviceConfig())
+        .then(device => {
+          const expectedSecret = device.config.auth.sessionSecret
+          if (expectedSecret && request.headers.authorization === `Bearer ${expectedSecret}`) {
+            handleConnection()
+            return
+          }
+
+          socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+        })
+        .catch(() => {
+          socket.destroy()
+        })
       return
     }
     socket.destroy()

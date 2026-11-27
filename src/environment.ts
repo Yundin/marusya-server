@@ -2,9 +2,13 @@ import 'dotenv/config'
 import { z } from 'zod'
 
 const environmentType = z.object({
+  ACCOUNT_USERNAME: z.string().default('Маруся'),
+
   API_PORT: z.string().default('31105').transform(Number),
 
   AUDIO_METADATA_URLS: z.string().default('http://speaker-identifier:9010/audio-metadata').transform(urls => urls.split(',').filter(Boolean)),
+
+  AUTH_MODE: z.enum(['open', 'enforce']).default('open'),
 
   DATABASE_URL: z.string().default(''),
   PORT: z.string().default('666').transform(Number),
